@@ -10,6 +10,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import motor.motor_asyncio
+from typing import Dict, Any
+
+# MongoDB setup
+MONGODB_URL = "mongodb+srv://your-connection-string"  # Replace with your MongoDB connection string
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URL)
+db = client.school_activities
+activities_collection = db.activities
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -19,8 +27,8 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
+# Initial activities data for database population
+INITIAL_ACTIVITIES = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -80,6 +88,22 @@ activities = {
     }
 }
 
+async def init_db():
+    """Initialize the database with activities if empty"""
+    if await activities_collection.count_documents({}) == 0:
+        # Insert all activities
+        for name, details in INITIAL_ACTIVITIES.items():
+            await activities_collection.insert_one({"_id": name, **details})
+
+@app.on_event("startup")
+async def startup_db_client():
+    """Initialize the database connection and populate initial data"""
+    await init_db()
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    """Close the database connection"""
+    client.close()
 
 @app.get("/")
 def root():
@@ -87,24 +111,35 @@ def root():
 
 
 @app.get("/activities")
-def get_activities():
+async def get_activities():
+    """Get all activities from the database"""
+    cursor = activities_collection.find({})
+    activities = {}
+    async for doc in cursor:
+        name = doc.pop("_id")  # Remove _id and use it as the key
+        activities[name] = doc
     return activities
 
-
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    # Validate student is not already signed up for the activity
-    for activity in activities.values():
-        if email in activity["participants"]:
-            raise HTTPException(status_code=400, detail="Student already signed up for an activity")            
+async def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    # Check if student is already signed up for any activity
+    cursor = activities_collection.find({"participants": email})
+    async for _ in cursor:
+        raise HTTPException(status_code=400, detail="Student already signed up for an activity")
 
     # Get the specific activity
-    activity = activities[activity_name]
+    activity = await activities_collection.find_one({"_id": activity_name})
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Add student
-    activity["participants"].append(email)
+    # Update participants list
+    result = await activities_collection.update_one(
+        {"_id": activity_name},
+        {"$push": {"participants": email}}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to update activity")
+
     return {"message": f"Signed up {email} for {activity_name}"}
